@@ -2,6 +2,14 @@ import ast, io, json, re, subprocess, sys, tarfile, tempfile
 from pathlib import Path
 
 RUNNER = Path(__file__).with_name("runner.py")
+PROOF_FILE = "test_patchguard_proof.py"
+MAX_PROOFS = 3
+
+# Simple, visible rules (these show up in the UI too)
+PENALTY = {"Proven": 25, "Tool-confirmed": 15, "Hypothesis": 5}
+SEVERITY = {"Proven": "High", "Tool-confirmed": "High", "Hypothesis": "Low"}
+CONFIDENCE = {"Proven": "High", "Tool-confirmed": "High", "Hypothesis": "Low"}
+TIER_ORDER = {"Proven": 0, "Tool-confirmed": 1, "Hypothesis": 2}
 
 
 def git(repo, *args):
@@ -39,11 +47,12 @@ def changed_functions(old, new, files):
     return out
 
 
-def run_tests(folder):
+def run_tests(folder, target=None):
+    cmd = [sys.executable, "-m", "pytest", "-q", "--tb=no", "-rA", "-p", "no:cacheprovider"]
+    if target:
+        cmd.append(target)
     try:
-        r = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "--tb=no", "-rA", "-p", "no:cacheprovider"],
-            cwd=folder, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(cmd, cwd=folder, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
         return None
     passed = set(re.findall(r"^PASSED (\S+)", r.stdout, re.M))
@@ -61,6 +70,43 @@ def run_func(folder, file, func):
         return {}
 
 
+def make_proof_test(file, func, diffs):
+    """Write a small test that pins down what the OLD code returned."""
+    cases = []
+    for key, (old_out, new_out) in diffs.items():
+        try:
+            args = ast.literal_eval(key)
+            expected = ast.literal_eval(old_out)
+        except Exception:
+            continue  # the old version raised an error here, so skip this input
+        cases.append((args, expected, key, old_out, new_out))
+        if len(cases) == MAX_PROOFS:
+            break
+    module = file[:-3].replace("/", ".")
+    lines = [f"from {module} import {func} as fn", ""]
+    for i, (args, expected, *_rest) in enumerate(cases):
+        lines += [f"def test_case_{i}():", f"    assert fn(*{args!r}) == {expected!r}", ""]
+    return "\n".join(lines), cases
+
+
+def prove(old, new, file, func, diffs):
+    """A drift is PROVEN if the generated test passes on old code and fails on new."""
+    code, cases = make_proof_test(file, func, diffs)
+    if not cases:
+        return [], code
+    (old / PROOF_FILE).write_text(code)
+    (new / PROOF_FILE).write_text(code)
+    r_old, r_new = run_tests(old, PROOF_FILE), run_tests(new, PROOF_FILE)
+    if not r_old or not r_new:
+        return [], code
+    ok = r_old[0] & r_new[1]
+    rows = []
+    for i, (args, expected, key, old_out, new_out) in enumerate(cases):
+        if f"{PROOF_FILE}::test_case_{i}" in ok:
+            rows.append({"input": key, "old": old_out, "new": new_out})
+    return rows, code
+
+
 def analyze(repo, base, head):
     findings = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -69,25 +115,55 @@ def analyze(repo, base, head):
         checkout(repo, head, new)
         funcs = changed_functions(old, new, changed_files(repo, base, head))
 
+        # Rung 2: tests that passed before and fail now
         t_old, t_new = run_tests(old), run_tests(new)
         if t_old and t_new:
-            for test in sorted(t_old[0] & t_new[1]):  # passed before, fails now
-                findings.append({"tier": "Tool-confirmed",
-                                 "title": f"{test} passed before and fails now"})
+            for test in sorted(t_old[0] & t_new[1]):
+                findings.append({
+                    "tier": "Tool-confirmed",
+                    "title": f"{test} passed before and fails now",
+                    "file": test.split("::")[0],
+                    "rows": [], "test_code": ""})
 
+        # Rung 1 or 3: behavior differences between old and new functions
         for f, name in funcs:
             a, b = run_func(old, f, name), run_func(new, f, name)
             diffs = {k: (a[k], b.get(k)) for k in a if a[k] != b.get(k)}
-            if diffs:
+            if not diffs:
+                continue
+            rows, code = prove(old, new, f, name, diffs)
+            if rows:
+                findings.append({"tier": "Proven", "file": f,
+                                 "title": f"{name}() changed behavior",
+                                 "rows": rows, "test_code": code})
+            else:
+                rows = [{"input": k, "old": o, "new": str(n)}
+                        for k, (o, n) in list(diffs.items())[:MAX_PROOFS]]
                 findings.append({"tier": "Hypothesis", "file": f,
-                                 "title": f"{name}() behaves differently", "diffs": diffs})
+                                 "title": f"{name}() behaves differently",
+                                 "rows": rows, "test_code": ""})
+
+    findings.sort(key=lambda x: TIER_ORDER[x["tier"]])
+    for i, item in enumerate(findings):
+        item["id"] = f"f{i}"
+        item["severity"] = SEVERITY[item["tier"]]
+        item["confidence"] = CONFIDENCE[item["tier"]]
     return findings
+
+
+def trust_score(findings, dismissed=()):
+    score = 100
+    for item in findings:
+        if item["id"] not in dismissed:
+            score -= PENALTY[item["tier"]]
+    return max(score, 0)
 
 
 if __name__ == "__main__":
     repo, base, head = sys.argv[1:4]
-    for item in analyze(repo, base, head):
+    results = analyze(repo, base, head)
+    for item in results:
         print(f"[{item['tier']}] {item['title']}")
-        for inp, (old_out, new_out) in list(item.get("diffs", {}).items())[:6]:
-            print(f"      input {inp}: old={old_out}  new={new_out}")
-            
+        for r in item["rows"]:
+            print(f"      input {r['input']}: old={r['old']}  new={r['new']}")
+    print("Trust score:", trust_score(results), "/ 100")
