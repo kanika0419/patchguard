@@ -1,4 +1,4 @@
-import ast, io, json, re, subprocess, sys, tarfile, tempfile
+import ast, difflib, io, json, re, shutil, subprocess, sys, tarfile, tempfile
 from pathlib import Path
 
 RUNNER = Path(__file__).with_name("runner.py")
@@ -133,9 +133,9 @@ def analyze(repo, base, head):
                 continue
             rows, code = prove(old, new, f, name, diffs)
             if rows:
-                findings.append({"tier": "Proven", "file": f,
-                                 "title": f"{name}() changed behavior",
-                                 "rows": rows, "test_code": code})
+                findings.append({"tier": "Proven", "file": f, "func": name,
+                                "title": f"{name}() changed behavior",
+                                "rows": rows, "test_code": code})
             else:
                 rows = [{"input": k, "old": o, "new": str(n)}
                         for k, (o, n) in list(diffs.items())[:MAX_PROOFS]]
@@ -158,7 +158,87 @@ def trust_score(findings, dismissed=()):
             score -= PENALTY[item["tier"]]
     return max(score, 0)
 
+def revert_text(text, old_srcs):
+    """Put the old version of the named functions back into a file's text."""
+    tree = ast.parse(text)
+    lines = text.split("\n")
+    spans = sorted(
+        ((n.lineno, n.end_lineno, n.name) for n in tree.body
+         if isinstance(n, ast.FunctionDef) and n.name in old_srcs),
+        reverse=True)
+    for start, end, name in spans:
+        lines[start - 1:end] = old_srcs[name].split("\n")
+    return "\n".join(lines)
 
+
+def judge(before, after):
+    """Compare test results before and after a fix."""
+    if before is None or after is None:
+        return {"status": "Could not verify", "note": "The tests timed out."}
+    bp, bf = before
+    ap, af = after
+    broke = sorted(bp & af)
+    healed = sorted(bf & ap)
+    proof_left = [t for t in af if t.startswith(PROOF_FILE)]
+    others = sorted(t for t in af if not t.startswith(PROOF_FILE))
+    out = {"before": (len(bp), len(bf)), "after": (len(ap), len(af))}
+    if broke:
+        out.update(status="Failed", note="The fix broke: " + ", ".join(broke))
+    elif proof_left:
+        out.update(status="Failed", note="The generated test still fails after this fix.")
+    elif healed:
+        note = "These tests now pass: " + ", ".join(healed) + "."
+        if others:
+            note += f" {len(others)} other test(s) still fail because of other findings."
+        out.update(status="Passed", note=note)
+    else:
+        out.update(status="Could not verify",
+                   note="No test changed result, so nothing was proven either way.")
+    return out
+
+
+def verify_fix(repo, base, head, file, func, proof_code=""):
+    """Try a fix in a throwaway copy and re-run the tests. Your real branch is never touched.
+    The fix is simple: put the old version of the function back."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            old, new = Path(tmp, "old"), Path(tmp, "new")
+            checkout(repo, base, old)
+            checkout(repo, head, new)
+            old_funcs = functions(old / file)
+            new_text = (new / file).read_text()
+            changed = [n for _, n in changed_functions(old, new, [file])]
+            if func not in changed:
+                return {"status": "Could not verify",
+                        "note": "Couldn't find that function in both versions."}
+            if proof_code:
+                (new / PROOF_FILE).write_text(proof_code)
+            before = run_tests(new)
+
+            attempts = [(f"{func}() only", [func])]
+            if len(changed) > 1:
+                attempts.append((f"all {len(changed)} changed functions in {file}", changed))
+            result, first_failed = None, False
+            for label, names in attempts:
+                fixed = revert_text(new_text, {n: old_funcs[n] for n in names})
+                (new / file).write_text(fixed)
+                for c in list(new.rglob("__pycache__")):
+                    shutil.rmtree(c, ignore_errors=True)
+                result = judge(before, run_tests(new))
+                result["scope"] = label
+                result["diff"] = "".join(difflib.unified_diff(
+                    new_text.splitlines(True), fixed.splitlines(True),
+                    fromfile=f"a/{file}", tofile=f"b/{file}"))
+                if result["status"] == "Passed":
+                    if first_failed:
+                        result["note"] = (f"Reverting {func}() alone wasn't enough, so this fix "
+                                          "puts back every changed function in the file. "
+                                          + result["note"])
+                    break
+                first_failed = True
+            return result
+    except Exception as e:
+        return {"status": "Could not verify", "note": f"Something went wrong: {e}"}
 if __name__ == "__main__":
     repo, base, head = sys.argv[1:4]
     results = analyze(repo, base, head)
